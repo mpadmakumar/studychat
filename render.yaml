@@ -3,7 +3,7 @@ services:
     name: studychat
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -k eventlet -w 1 --bind 0.0.0.0:$PORT app:socketio_app
+    startCommand: gunicorn --worker-class geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 --bind 0.0.0.0:$PORT "app:app"
     envVars:
       - key: GROQ_API_KEY
         sync: false

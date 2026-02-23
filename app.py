@@ -8,9 +8,9 @@ from datetime import datetime
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'student-chat-secret-2024'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
-# Use eventlet on Render (production), threading locally (Python 3.14 compat)
+# Use gevent on Render (production), threading locally (Python 3.14 compat)
 import os as _os
-_async_mode = "eventlet" if _os.environ.get("RENDER") else "threading"
+_async_mode = "gevent" if _os.environ.get("RENDER") else "threading"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode=_async_mode,
                     max_http_buffer_size=16 * 1024 * 1024)
 
