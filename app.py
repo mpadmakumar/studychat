@@ -8,7 +8,10 @@ from datetime import datetime
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'student-chat-secret-2024'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
+# Use eventlet on Render (production), threading locally (Python 3.14 compat)
+import os as _os
+_async_mode = "eventlet" if _os.environ.get("RENDER") else "threading"
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode=_async_mode,
                     max_http_buffer_size=16 * 1024 * 1024)
 
 # ── Groq Setup — Pure HTTP (Python 3.14 compatible) ───
@@ -327,15 +330,18 @@ def on_ask_bot(data):
         emit("bot_typing", {"typing": False}, broadcast=True)
         emit("error", {"message": str(e)})
 
+# ── Gunicorn entry point (Render production) ─────────
+socketio_app = socketio.middleware(app)
+
 if __name__ == "__main__":
     if not GROQ_API_KEY:
         print("ERROR: GROQ_API_KEY not set!")
         print("Run: set GROQ_API_KEY=gsk_xxxxxxxxxxxx")
         exit(1)
+    port = int(os.environ.get("PORT", 5000))  # Render sets PORT automatically
+    debug = os.environ.get("RENDER") is None  # debug=False on Render, True locally
     print("\n" + "=" * 55)
     print("  StudyChat — Groq Llama 3.3 (FREE FOREVER)")
-    print("  No external library — Pure Python HTTP!")
-    print("  14,400 req/day | 30 req/min | Python 3.14 OK")
-    print("=" * 55)
-    print("  Open: http://localhost:5000\n")
-    socketio.run(app, debug=True, host="0.0.0.0", port=5000)
+    print(f"  Running on port {port} | debug={debug}")
+    print("=" * 55 + "\n")
+    socketio.run(app, debug=debug, host="0.0.0.0", port=port)
