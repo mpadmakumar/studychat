@@ -339,4 +339,5 @@ if __name__ == "__main__":
     print("  StudyChat — Groq Llama 3.3 (FREE FOREVER)")
     print(f"  Running on port {port} | debug={debug}")
     print("=" * 55 + "\n")
-    socketio.run(app, debug=debug, host="0.0.0.0", port=port)
+    socketio.run(app, debug=debug, host="0.0.0.0", port=port,
+                 allow_unsafe_werkzeug=True)
