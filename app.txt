@@ -1,0 +1,1140 @@
+from flask import Flask, render_template, request, jsonify
+from flask_socketio import SocketIO, emit
+import anthropic
+import os
+import json
+from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()  # 👈 This loads .env file
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'student-chat-secret-2024'
+
+client = anthropic.Anthropic(
+    api_key=os.getenv("ANTHROPIC_API_KEY")
+)
+
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+active_users = {}
+chat_history = []
+
+SYSTEM_PROMPT = """You are StudyBot 🎓 — a friendly AI study assistant for students.
+- Explain concepts clearly with step-by-step breakdowns
+- Use examples and analogies
+- Support Tamil and English (code-switch if student writes in Tamil)
+- Be warm, encouraging, and educational
+- Format answers with numbered steps when needed
+- Start response with a relevant emoji"""
+
+# ─── Routes ─────────────────────────────────────
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+@app.route('/upload-pdf', methods=['POST'])
+def upload_pdf():
+    try:
+        data = request.json
+        pdf_text = data.get('text', '').strip()
+        filename = data.get('filename', 'document.pdf')
+
+        if not pdf_text:
+            return jsonify({'error': 'No text found in PDF'}), 400
+
+        if len(pdf_text) > 12000:
+            pdf_text = pdf_text[:12000] + "\n\n[... truncated ...]"
+
+        response = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=1500,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content":
+                f'PDF: "{filename}"\n\nContent:\n{pdf_text}\n\n'
+                f'Please: 1) Brief summary (3-4 sentences) 2) Top 5 key points 3) 3 exam questions from this'}]
+        )
+
+        summary = response.content[0].text
+        bot_msg = {
+            'type': 'bot', 'username': 'StudyBot 🎓',
+            'message': f'📄 PDF Uploaded: {filename}\n\n{summary}',
+            'timestamp': datetime.now().strftime('%H:%M'), 'sid': 'bot'
+        }
+        chat_history.append(bot_msg)
+        socketio.emit('new_message', bot_msg)
+        return jsonify({'success': True, 'summary': summary})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/generate-quiz', methods=['POST'])
+def generate_quiz():
+    try:
+        data = request.json
+        topic = data.get('topic', '').strip()
+        subject = data.get('subject', 'General')
+        count = min(int(data.get('count', 5)), 10)
+
+        if not topic:
+            return jsonify({'error': 'Topic required'}), 400
+
+        response = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=2500,
+            system="""Generate MCQ quiz as pure JSON only. No markdown, no extra text. Format:
+{"questions":[{"q":"Question?","options":["A) opt1","B) opt2","C) opt3","D) opt4"],"answer":"A","explanation":"Why A is correct"}]}""",
+            messages=[{"role": "user", "content":
+                f'Generate {count} MCQ questions on "{topic}" for {subject} students. Medium difficulty.'}]
+        )
+
+        raw = response.content[0].text.strip()
+        if '```' in raw:
+            raw = raw.split('```')[1].lstrip('json').strip()
+            if '```' in raw:
+                raw = raw.split('```')[0].strip()
+
+        quiz_data = json.loads(raw)
+        return jsonify({'success': True, 'quiz': quiz_data, 'topic': topic, 'subject': subject})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ─── Socket Events ──────────────────────────────
+
+@socketio.on('connect')
+def on_connect():
+    print(f"Connected: {request.sid}")
+
+@socketio.on('disconnect')
+def on_disconnect():
+    if request.sid in active_users:
+        username = active_users.pop(request.sid)
+        emit('user_left', {'username': username, 'active_count': len(active_users)}, broadcast=True)
+
+@socketio.on('join')
+def on_join(data):
+    username = data.get('username', 'Student')
+    active_users[request.sid] = username
+    emit('chat_history', {'messages': chat_history[-50:]})
+    emit('user_joined', {'username': username, 'active_count': len(active_users)}, broadcast=True)
+    emit('active_users', {'users': list(active_users.values())})
+
+@socketio.on('send_message')
+def on_message(data):
+    username = active_users.get(request.sid, 'Unknown')
+    message = data.get('message', '').strip()
+    if not message:
+        return
+
+    timestamp = datetime.now().strftime('%H:%M')
+    msg_obj = {'type': 'user', 'username': username, 'message': message,
+                'timestamp': timestamp, 'sid': request.sid}
+    chat_history.append(msg_obj)
+    emit('new_message', msg_obj, broadcast=True)
+
+    if message.lower().startswith('@bot') or message.lower().startswith('bot,') or message.endswith('?'):
+        emit('bot_typing', {'typing': True}, broadcast=True)
+        try:
+            query = message.replace('@bot', '').replace('bot,', '').strip() or message
+            response = client.messages.create(
+                model="claude-opus-4-6", max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": query}]
+            )
+            bot_reply = response.content[0].text
+            bot_msg = {'type': 'bot', 'username': 'StudyBot 🎓', 'message': bot_reply,
+                       'timestamp': datetime.now().strftime('%H:%M'), 'sid': 'bot'}
+            chat_history.append(bot_msg)
+            emit('bot_typing', {'typing': False}, broadcast=True)
+            emit('new_message', bot_msg, broadcast=True)
+        except Exception as e:
+            emit('bot_typing', {'typing': False}, broadcast=True)
+            emit('new_message', {'type': 'bot', 'username': 'StudyBot 🎓',
+                 'message': f'⚠️ Error: {str(e)}',
+                 'timestamp': datetime.now().strftime('%H:%M'), 'sid': 'bot'}, broadcast=True)
+
+@socketio.on('ask_bot')
+def on_ask_bot(data):
+    username = active_users.get(request.sid, 'Student')
+    question = data.get('question', '').strip()
+    subject = data.get('subject', 'General')
+    if not question:
+        return
+
+    user_msg = {'type': 'user', 'username': username,
+                'message': f'[{subject}] {question}',
+                'timestamp': datetime.now().strftime('%H:%M'), 'sid': request.sid}
+    chat_history.append(user_msg)
+    emit('new_message', user_msg, broadcast=True)
+    emit('bot_typing', {'typing': True}, broadcast=True)
+
+    try:
+        response = client.messages.create(
+            model="claude-opus-4-6", max_tokens=1500,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": f"Subject: {subject}\nQuestion: {question}"}]
+        )
+        bot_reply = response.content[0].text
+        bot_msg = {'type': 'bot', 'username': 'StudyBot 🎓', 'message': bot_reply,
+                   'timestamp': datetime.now().strftime('%H:%M'), 'sid': 'bot'}
+        chat_history.append(bot_msg)
+        emit('bot_typing', {'typing': False}, broadcast=True)
+        emit('new_message', bot_msg, broadcast=True)
+    except Exception as e:
+        emit('bot_typing', {'typing': False}, broadcast=True)
+        emit('error', {'message': str(e)})
+
+if __name__ == '__main__':
+    print("\n" + "="*50)
+    print("🎓 StudyChat ENHANCED — All Features Active!")
+    print("📄 PDF Upload  🧠 Quiz Generator")
+    print("⏱️  Study Timer  🎤 Voice Input")
+    print("💬 Real-time Group Chat  🤖 AI Tutor")
+    print("="*50)
+    print("▶  Open: http://localhost:5000\n")
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
+
+
+
+
+
+
+
+
+
+
+
+=================================================================================================
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>StudyChat – AI Student Hub</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:#0a0e1a; --surface:#111827; --surface2:#1a2235;
+  --border:#1e2d45; --accent:#00d4ff; --accent2:#7c3aed;
+  --bot:#10b981; --text:#e2e8f0; --muted:#64748b;
+  --gold:#f59e0b; --danger:#ef4444; --warn:#f97316;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);height:100vh;overflow:hidden;
+  background-image:radial-gradient(ellipse at 15% 50%,rgba(0,212,255,.04) 0%,transparent 60%),
+  radial-gradient(ellipse at 85% 20%,rgba(124,58,237,.05) 0%,transparent 60%);}
+
+/* ── Layout ── */
+.app{display:grid;grid-template-columns:290px 1fr;height:100vh;}
+
+/* ── Sidebar ── */
+.sidebar{background:var(--surface);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;overflow:hidden;}
+
+.logo-area{padding:18px 18px 14px;border-bottom:1px solid var(--border);flex-shrink:0;}
+.logo{font-family:'Syne',sans-serif;font-weight:800;font-size:20px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.logo-sub{font-size:10px;color:var(--muted);margin-top:2px;-webkit-text-fill-color:var(--muted);}
+.online-badge{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--bot);margin-top:8px;}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--bot);animation:pulse 2s infinite;}
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:.3;}}
+
+/* ── Sidebar Tabs ── */
+.stabs{display:flex;border-bottom:1px solid var(--border);flex-shrink:0;}
+.stab{flex:1;padding:10px 6px;text-align:center;font-size:10px;font-weight:600;
+  color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;
+  letter-spacing:.5px;text-transform:uppercase;transition:all .2s;}
+.stab.active{color:var(--accent);border-bottom-color:var(--accent);}
+
+.spanel{display:none;flex-direction:column;flex:1;overflow-y:auto;padding:14px;}
+.spanel.active{display:flex;}
+.spanel::-webkit-scrollbar{width:3px;}
+.spanel::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px;}
+
+.sec-title{font-size:9px;font-weight:700;letter-spacing:1.5px;color:var(--muted);
+  text-transform:uppercase;margin-bottom:8px;}
+
+/* Ask Bot Panel */
+.subj-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:8px;}
+.subj-btn{padding:7px 5px;border-radius:7px;border:1px solid var(--border);
+  background:var(--surface2);color:var(--text);font-size:11px;font-weight:500;
+  cursor:pointer;text-align:center;transition:all .2s;}
+.subj-btn:hover,.subj-btn.active{border-color:var(--accent);color:var(--accent);background:rgba(0,212,255,.08);}
+.q-textarea{width:100%;padding:9px 11px;background:var(--surface2);border:1px solid var(--border);
+  border-radius:8px;color:var(--text);font-size:12px;font-family:'DM Sans',sans-serif;
+  resize:none;height:65px;outline:none;transition:border .2s;margin-bottom:8px;}
+.q-textarea:focus{border-color:var(--accent);}
+.action-btn{width:100%;padding:9px;background:linear-gradient(135deg,var(--accent2),var(--accent));
+  border:none;border-radius:8px;color:white;font-weight:700;font-size:12px;
+  font-family:'Syne',sans-serif;cursor:pointer;transition:opacity .2s,transform .1s;margin-bottom:6px;}
+.action-btn:hover{opacity:.9;}
+.action-btn:active{transform:scale(.97);}
+.action-btn.secondary{background:var(--surface2);border:1px solid var(--border);
+  color:var(--text);font-weight:500;}
+.action-btn.secondary:hover{border-color:var(--accent);color:var(--accent);}
+.action-btn.danger{background:linear-gradient(135deg,#dc2626,var(--danger));}
+
+/* PDF Panel */
+.pdf-drop{border:2px dashed var(--border);border-radius:10px;padding:20px;
+  text-align:center;cursor:pointer;transition:all .2s;margin-bottom:10px;}
+.pdf-drop:hover,.pdf-drop.drag-over{border-color:var(--accent);background:rgba(0,212,255,.05);}
+.pdf-drop-icon{font-size:28px;margin-bottom:6px;}
+.pdf-drop-text{font-size:11px;color:var(--muted);}
+.pdf-drop-text strong{color:var(--accent);display:block;font-size:12px;margin-bottom:2px;}
+#pdfFileInput{display:none;}
+.pdf-status{font-size:11px;padding:8px;border-radius:6px;text-align:center;display:none;}
+.pdf-status.loading{background:rgba(0,212,255,.1);color:var(--accent);display:block;}
+.pdf-status.done{background:rgba(16,185,129,.1);color:var(--bot);display:block;}
+.pdf-status.err{background:rgba(239,68,68,.1);color:var(--danger);display:block;}
+
+/* Quiz Panel */
+.quiz-input{width:100%;padding:9px 11px;background:var(--surface2);border:1px solid var(--border);
+  border-radius:8px;color:var(--text);font-size:12px;font-family:'DM Sans',sans-serif;
+  outline:none;transition:border .2s;margin-bottom:8px;}
+.quiz-input:focus{border-color:var(--gold);}
+.quiz-input::placeholder{color:var(--muted);}
+.quiz-count-row{display:flex;gap:6px;margin-bottom:8px;align-items:center;}
+.quiz-count-row label{font-size:11px;color:var(--muted);white-space:nowrap;}
+.quiz-count-row input{flex:1;padding:7px;background:var(--surface2);border:1px solid var(--border);
+  border-radius:6px;color:var(--text);font-size:12px;outline:none;text-align:center;}
+.action-btn.gold{background:linear-gradient(135deg,#d97706,var(--gold));}
+
+/* Timer Panel */
+.timer-display{text-align:center;padding:16px 10px;}
+.timer-ring-wrap{position:relative;width:120px;height:120px;margin:0 auto 12px;}
+.timer-ring-wrap svg{transform:rotate(-90deg);}
+.timer-ring-bg{fill:none;stroke:var(--border);stroke-width:6;}
+.timer-ring-prog{fill:none;stroke:var(--accent);stroke-width:6;stroke-linecap:round;
+  transition:stroke-dashoffset .5s linear;}
+.timer-time{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;}
+.timer-time span{font-family:'Space Mono',monospace;font-size:22px;font-weight:700;color:var(--text);}
+.timer-time small{font-size:9px;color:var(--muted);margin-top:2px;letter-spacing:1px;text-transform:uppercase;}
+.timer-mode-row{display:flex;gap:6px;margin-bottom:10px;}
+.mode-btn{flex:1;padding:7px;border-radius:7px;border:1px solid var(--border);
+  background:var(--surface2);color:var(--muted);font-size:10px;font-weight:600;
+  cursor:pointer;text-align:center;transition:all .2s;letter-spacing:.5px;}
+.mode-btn.active{border-color:var(--accent);color:var(--accent);background:rgba(0,212,255,.1);}
+.timer-controls{display:flex;gap:6px;}
+.timer-btn{flex:1;padding:9px;border-radius:8px;border:none;cursor:pointer;
+  font-size:13px;font-weight:700;transition:all .2s;}
+.timer-btn.start{background:var(--bot);color:white;}
+.timer-btn.start:hover{background:#059669;}
+.timer-btn.reset{background:var(--surface2);border:1px solid var(--border);color:var(--muted);}
+.timer-btn.reset:hover{color:var(--text);}
+.timer-sessions{font-size:10px;color:var(--muted);text-align:center;margin-top:10px;}
+.timer-sessions span{color:var(--gold);}
+
+/* Users Panel */
+.user-item{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:7px;
+  font-size:12px;margin-bottom:3px;transition:background .2s;}
+.user-item:hover{background:var(--surface2);}
+.u-avatar{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;
+  justify-content:center;font-size:10px;font-weight:700;color:white;flex-shrink:0;
+  background:linear-gradient(135deg,var(--accent2),var(--accent));}
+
+/* ── Main Chat ── */
+.main{display:flex;flex-direction:column;overflow:hidden;}
+
+.chat-header{padding:14px 20px;border-bottom:1px solid var(--border);background:var(--surface);
+  display:flex;align-items:center;justify-content:space-between;flex-shrink:0;}
+.chat-header h2{font-family:'Syne',sans-serif;font-size:15px;font-weight:700;}
+.header-sub{font-size:10px;color:var(--muted);margin-top:2px;}
+.header-badges{display:flex;gap:6px;align-items:center;}
+.hbadge{display:flex;align-items:center;gap:4px;font-size:10px;padding:4px 9px;
+  border-radius:20px;border:1px solid;font-weight:600;}
+.hbadge.green{color:var(--bot);border-color:rgba(16,185,129,.3);background:rgba(16,185,129,.08);}
+.hbadge.blue{color:var(--accent);border-color:rgba(0,212,255,.3);background:rgba(0,212,255,.08);}
+
+/* Messages */
+.messages-area{flex:1;overflow-y:auto;padding:16px 20px;display:flex;flex-direction:column;gap:10px;}
+.messages-area::-webkit-scrollbar{width:3px;}
+.messages-area::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px;}
+
+.message{display:flex;gap:9px;max-width:82%;animation:fadeIn .3s ease;}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:translateY(0);}}
+.message.own{flex-direction:row-reverse;align-self:flex-end;}
+.message.bot-msg{max-width:90%;}
+
+.msg-av{width:30px;height:30px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;
+  justify-content:center;font-size:11px;font-weight:700;margin-top:3px;}
+.msg-av.u{background:linear-gradient(135deg,var(--accent2),#a855f7);color:white;}
+.msg-av.b{background:linear-gradient(135deg,var(--bot),#059669);color:white;font-size:13px;}
+.msg-av.me{background:linear-gradient(135deg,var(--accent),#0ea5e9);color:white;}
+
+.msg-c{display:flex;flex-direction:column;gap:2px;}
+.msg-meta{display:flex;align-items:center;gap:5px;}
+.msg-name{font-size:10px;font-weight:600;color:var(--muted);}
+.msg-name.bot{color:var(--bot);}
+.msg-time{font-size:9px;color:var(--muted);}
+.msg-bubble{padding:9px 13px;border-radius:13px;font-size:13px;line-height:1.65;white-space:pre-wrap;}
+.message:not(.own):not(.bot-msg) .msg-bubble{background:var(--surface2);border:1px solid var(--border);border-top-left-radius:3px;}
+.message.own .msg-bubble{background:linear-gradient(135deg,rgba(0,212,255,.12),rgba(124,58,237,.12));
+  border:1px solid rgba(0,212,255,.22);border-top-right-radius:3px;}
+.message.bot-msg .msg-bubble{background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.18);
+  border-top-left-radius:3px;}
+
+.sys-msg{text-align:center;font-size:10px;color:var(--muted);padding:3px 10px;font-style:italic;}
+
+/* Typing */
+.typing-wrap{padding:0 20px 6px;flex-shrink:0;}
+.typing-indicator{display:none;align-items:center;gap:8px;}
+.typing-indicator.show{display:flex;}
+.typing-dots{display:flex;gap:3px;}
+.typing-dots span{width:5px;height:5px;border-radius:50%;background:var(--bot);animation:bounce 1.2s infinite;}
+.typing-dots span:nth-child(2){animation-delay:.2s;}
+.typing-dots span:nth-child(3){animation-delay:.4s;}
+@keyframes bounce{0%,60%,100%{transform:translateY(0);}30%{transform:translateY(-5px);}}
+.typing-text{font-size:11px;color:var(--bot);}
+
+/* Input */
+.input-area{padding:12px 20px;border-top:1px solid var(--border);background:var(--surface);flex-shrink:0;}
+.input-hint{font-size:10px;color:var(--muted);margin-bottom:6px;}
+.input-hint code{background:var(--surface2);padding:1px 4px;border-radius:3px;
+  font-family:'Space Mono',monospace;color:var(--accent);font-size:9px;}
+.input-row{display:flex;gap:6px;align-items:flex-end;}
+.msg-input{flex:1;padding:11px 14px;background:var(--surface2);border:1px solid var(--border);
+  border-radius:11px;color:var(--text);font-size:13px;font-family:'DM Sans',sans-serif;
+  outline:none;resize:none;max-height:110px;line-height:1.5;transition:border .2s;}
+.msg-input:focus{border-color:var(--accent);}
+.msg-input::placeholder{color:var(--muted);}
+.icon-btn{width:40px;height:40px;border-radius:10px;border:1px solid var(--border);
+  background:var(--surface2);cursor:pointer;color:var(--muted);font-size:16px;
+  display:flex;align-items:center;justify-content:center;transition:all .2s;flex-shrink:0;}
+.icon-btn:hover{border-color:var(--accent);color:var(--accent);}
+.icon-btn.recording{border-color:var(--danger);color:var(--danger);background:rgba(239,68,68,.1);animation:pulse 1s infinite;}
+.send-btn{width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,var(--accent2),var(--accent));
+  border:none;cursor:pointer;color:white;font-size:16px;display:flex;align-items:center;
+  justify-content:center;transition:transform .1s,opacity .2s;flex-shrink:0;}
+.send-btn:hover{opacity:.9;}
+.send-btn:active{transform:scale(.9);}
+
+/* ── Quiz Modal ── */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.85);backdrop-filter:blur(8px);
+  display:none;align-items:center;justify-content:center;z-index:200;}
+.modal-overlay.show{display:flex;}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:18px;
+  padding:28px;width:600px;max-width:95vw;max-height:85vh;overflow-y:auto;
+  animation:modalIn .35s cubic-bezier(.34,1.56,.64,1);}
+@keyframes modalIn{from{transform:scale(.85);opacity:0;}to{transform:scale(1);opacity:1;}}
+.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;}
+.modal-title{font-family:'Syne',sans-serif;font-size:18px;font-weight:700;}
+.modal-close{background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;padding:4px 8px;
+  border-radius:6px;transition:all .2s;}
+.modal-close:hover{background:var(--surface2);color:var(--text);}
+
+/* Quiz question cards */
+.quiz-question{background:var(--surface2);border:1px solid var(--border);border-radius:12px;
+  padding:16px;margin-bottom:12px;}
+.quiz-q-num{font-size:10px;color:var(--muted);font-weight:600;letter-spacing:1px;
+  text-transform:uppercase;margin-bottom:6px;}
+.quiz-q-text{font-size:14px;font-weight:500;margin-bottom:12px;line-height:1.5;}
+.quiz-options{display:grid;gap:6px;}
+.quiz-opt{padding:9px 13px;border-radius:8px;border:1px solid var(--border);
+  background:var(--bg);font-size:13px;cursor:pointer;transition:all .2s;text-align:left;}
+.quiz-opt:hover:not(.selected):not(.correct):not(.wrong){border-color:var(--accent);background:rgba(0,212,255,.06);}
+.quiz-opt.selected{border-color:var(--accent2);background:rgba(124,58,237,.12);}
+.quiz-opt.correct{border-color:var(--bot);background:rgba(16,185,129,.12);color:var(--bot);}
+.quiz-opt.wrong{border-color:var(--danger);background:rgba(239,68,68,.1);color:var(--danger);}
+.quiz-explanation{margin-top:8px;font-size:12px;color:var(--bot);padding:8px 10px;
+  background:rgba(16,185,129,.08);border-radius:6px;display:none;}
+.quiz-explanation.show{display:block;}
+.quiz-score{text-align:center;padding:20px;font-family:'Syne',sans-serif;}
+.quiz-score-num{font-size:48px;font-weight:800;color:var(--gold);}
+.quiz-score-label{font-size:14px;color:var(--muted);margin-top:4px;}
+
+/* Login modal */
+#loginModal{display:flex;}
+.login-box{background:var(--surface);border:1px solid var(--border);border-radius:20px;
+  padding:36px;width:360px;text-align:center;animation:modalIn .4s cubic-bezier(.34,1.56,.64,1);}
+.login-logo{font-family:'Syne',sans-serif;font-weight:800;font-size:30px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:4px;}
+.login-sub{font-size:12px;color:var(--muted);margin-bottom:24px;}
+.login-input{width:100%;padding:13px 16px;background:var(--surface2);border:1px solid var(--border);
+  border-radius:11px;color:var(--text);font-size:14px;font-family:'DM Sans',sans-serif;
+  outline:none;margin-bottom:12px;text-align:center;transition:border .2s;}
+.login-input:focus{border-color:var(--accent);}
+.login-btn{width:100%;padding:13px;background:linear-gradient(135deg,var(--accent2),var(--accent));
+  border:none;border-radius:11px;color:white;font-weight:700;font-size:14px;
+  font-family:'Syne',sans-serif;cursor:pointer;transition:opacity .2s;}
+.login-btn:hover{opacity:.9;}
+.feature-pills{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-top:16px;}
+.fpill{font-size:10px;color:var(--muted);background:var(--surface2);padding:4px 9px;
+  border-radius:20px;border:1px solid var(--border);}
+</style>
+</head>
+<body>
+
+<!-- ── Login Modal ── -->
+<div class="modal-overlay" id="loginModal">
+  <div class="login-box">
+    <div class="login-logo">StudyChat</div>
+    <div class="login-sub">AI-Powered Student Learning Hub 🎓</div>
+    <input class="login-input" id="nameInput" type="text" placeholder="Your name" maxlength="20"/>
+    <button class="login-btn" onclick="joinChat()">Enter Study Room →</button>
+    <div class="feature-pills">
+      <span class="fpill">🤖 AI Tutor</span>
+      <span class="fpill">📄 PDF Upload</span>
+      <span class="fpill">🧠 Quiz</span>
+      <span class="fpill">⏱️ Timer</span>
+      <span class="fpill">🎤 Voice</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── Quiz Modal ── -->
+<div class="modal-overlay" id="quizModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title" id="quizTitle">📝 Quiz</div>
+      <button class="modal-close" onclick="closeQuiz()">✕</button>
+    </div>
+    <div id="quizBody"></div>
+  </div>
+</div>
+
+<!-- ── Main App ── -->
+<div class="app">
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="logo-area">
+      <div class="logo">StudyChat</div>
+      <div class="logo-sub">AI Student Hub</div>
+      <div class="online-badge"><span class="dot"></span><span id="onlineCount">0</span> students online</div>
+    </div>
+
+    <!-- Sidebar Tabs -->
+    <div class="stabs">
+      <div class="stab active" onclick="switchTab('ask')">🤖 Ask</div>
+      <div class="stab" onclick="switchTab('pdf')">📄 PDF</div>
+      <div class="stab" onclick="switchTab('quiz')">🧠 Quiz</div>
+      <div class="stab" onclick="switchTab('timer')">⏱️ Timer</div>
+      <div class="stab" onclick="switchTab('users')">👥 Room</div>
+    </div>
+
+    <!-- ASK BOT Panel -->
+    <div class="spanel active" id="panel-ask">
+      <div class="sec-title">Subject</div>
+      <div class="subj-grid" id="subjectGrid">
+        <button class="subj-btn active" onclick="selectSubject(this,'Mathematics')">📐 Math</button>
+        <button class="subj-btn" onclick="selectSubject(this,'Physics')">⚛️ Physics</button>
+        <button class="subj-btn" onclick="selectSubject(this,'Chemistry')">🧪 Chemistry</button>
+        <button class="subj-btn" onclick="selectSubject(this,'Biology')">🧬 Biology</button>
+        <button class="subj-btn" onclick="selectSubject(this,'Programming')">💻 Coding</button>
+        <button class="subj-btn" onclick="selectSubject(this,'History')">📜 History</button>
+        <button class="subj-btn" onclick="selectSubject(this,'English')">✍️ English</button>
+        <button class="subj-btn" onclick="selectSubject(this,'General')">💡 General</button>
+      </div>
+      <div class="sec-title" style="margin-top:4px;">Your Question</div>
+      <textarea class="q-textarea" id="quickQuestion" placeholder="Type your doubt here..."></textarea>
+      <button class="action-btn" onclick="askBot()">🎓 Ask StudyBot</button>
+    </div>
+
+    <!-- PDF Panel -->
+    <div class="spanel" id="panel-pdf">
+      <div class="sec-title">Upload PDF Notes</div>
+      <div class="pdf-drop" id="pdfDrop" onclick="document.getElementById('pdfFileInput').click()"
+           ondragover="pdfDragOver(event)" ondragleave="pdfDragLeave()" ondrop="pdfDrop_ev(event)">
+        <div class="pdf-drop-icon">📄</div>
+        <div class="pdf-drop-text">
+          <strong>Click or drag PDF here</strong>
+          Textbook, notes, any study material
+        </div>
+      </div>
+      <input type="file" id="pdfFileInput" accept=".pdf" onchange="handlePdfFile(this.files[0])"/>
+      <div class="pdf-status" id="pdfStatus">Processing...</div>
+      <div class="sec-title" style="margin-top:12px;">How it works</div>
+      <div style="font-size:11px;color:var(--muted);line-height:1.7;">
+        📤 Upload your PDF notes<br>
+        🤖 StudyBot reads & summarizes it<br>
+        ❓ Get key points + exam questions<br>
+        💬 Summary shared in chat room
+      </div>
+    </div>
+
+    <!-- QUIZ Panel -->
+    <div class="spanel" id="panel-quiz">
+      <div class="sec-title">Generate Quiz</div>
+      <input class="quiz-input" id="quizTopic" placeholder="Topic (e.g. Photosynthesis)" type="text"/>
+      <input class="quiz-input" id="quizSubject" placeholder="Subject (e.g. Biology)" type="text"/>
+      <div class="quiz-count-row">
+        <label>Questions:</label>
+        <input type="number" id="quizCount" value="5" min="3" max="10" style="width:60px;"/>
+      </div>
+      <button class="action-btn gold" onclick="generateQuiz()">🧠 Generate Quiz</button>
+      <div style="font-size:11px;color:var(--muted);line-height:1.7;margin-top:8px;">
+        ✅ Multiple choice questions<br>
+        💡 Explanations for each answer<br>
+        📊 Score tracking<br>
+        🔄 Generate as many as you want
+      </div>
+    </div>
+
+    <!-- TIMER Panel -->
+    <div class="spanel" id="panel-timer">
+      <div class="timer-display">
+        <div class="timer-mode-row">
+          <div class="mode-btn active" id="mode-focus" onclick="setTimerMode('focus')">🎯 Focus</div>
+          <div class="mode-btn" id="mode-short" onclick="setTimerMode('short')">☕ Short Break</div>
+          <div class="mode-btn" id="mode-long" onclick="setTimerMode('long')">🛋️ Long Break</div>
+        </div>
+        <div class="timer-ring-wrap">
+          <svg width="120" height="120">
+            <circle class="timer-ring-bg" cx="60" cy="60" r="52"/>
+            <circle class="timer-ring-prog" id="timerRing" cx="60" cy="60" r="52"
+              stroke-dasharray="326.7" stroke-dashoffset="0"/>
+          </svg>
+          <div class="timer-time">
+            <span id="timerDisplay">25:00</span>
+            <small id="timerLabel">FOCUS</small>
+          </div>
+        </div>
+        <div class="timer-controls">
+          <button class="timer-btn start" id="timerStartBtn" onclick="toggleTimer()">▶ Start</button>
+          <button class="timer-btn reset" onclick="resetTimer()">↺ Reset</button>
+        </div>
+        <div class="timer-sessions">Sessions completed: <span id="sessionCount">0</span> 🍅</div>
+      </div>
+      <div style="font-size:11px;color:var(--muted);line-height:1.8;margin-top:4px;">
+        🎯 Focus: 25 min study<br>
+        ☕ Short Break: 5 min rest<br>
+        🛋️ Long Break: 15 min rest<br>
+        🍅 Complete 4 pomodoros for a long break
+      </div>
+    </div>
+
+    <!-- USERS Panel -->
+    <div class="spanel" id="panel-users">
+      <div class="sec-title">Students in Room</div>
+      <div id="usersList"></div>
+    </div>
+
+  </div><!-- /sidebar -->
+
+  <!-- Main Chat -->
+  <div class="main">
+    <div class="chat-header">
+      <div>
+        <h2>📚 Study Room</h2>
+        <div class="header-sub">Use <code style="font-family:monospace;background:#1a2235;padding:1px 4px;border-radius:3px;font-size:9px;color:#00d4ff">@bot</code> or end with <code style="font-family:monospace;background:#1a2235;padding:1px 4px;border-radius:3px;font-size:9px;color:#00d4ff">?</code> for AI help</div>
+      </div>
+      <div class="header-badges">
+        <div class="hbadge green"><span class="dot" style="background:var(--bot)"></span> Bot Active</div>
+        <div class="hbadge blue" id="timerBadge" style="display:none">⏱️ <span id="timerBadgeTime">25:00</span></div>
+      </div>
+    </div>
+
+    <div class="messages-area" id="messagesArea"></div>
+
+    <div class="typing-wrap">
+      <div class="typing-indicator" id="typingIndicator">
+        <div class="typing-dots"><span></span><span></span><span></span></div>
+        <span class="typing-text">StudyBot is thinking...</span>
+      </div>
+    </div>
+
+    <div class="input-area">
+      <div class="input-hint">
+        <code>@bot explain topic</code> · End with <code>?</code> for AI · <code>🎤</code> for voice
+      </div>
+      <div class="input-row">
+        <button class="icon-btn" id="voiceBtn" onclick="toggleVoice()" title="Voice Input">🎤</button>
+        <textarea class="msg-input" id="msgInput" placeholder="Type a message..." rows="1"
+          onkeydown="handleKey(event)"></textarea>
+        <button class="send-btn" onclick="sendMessage()">➤</button>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /app -->
+
+<script>
+// PDF.js worker
+if(typeof pdfjsLib !== 'undefined'){
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+}
+
+const socket = io();
+let myUsername = '';
+let selectedSubject = 'Mathematics';
+
+// ─── Auth ───────────────────────────────────
+function joinChat(){
+  const name = document.getElementById('nameInput').value.trim();
+  if(!name) return document.getElementById('nameInput').focus();
+  myUsername = name;
+  document.getElementById('loginModal').style.display = 'none';
+  socket.emit('join', {username: name});
+}
+document.getElementById('nameInput').addEventListener('keydown', e => { if(e.key==='Enter') joinChat(); });
+
+// ─── Sidebar Tabs ───────────────────────────
+function switchTab(tab){
+  document.querySelectorAll('.stab').forEach((t,i) => {
+    const tabs = ['ask','pdf','quiz','timer','users'];
+    t.classList.toggle('active', tabs[i]===tab);
+  });
+  document.querySelectorAll('.spanel').forEach(p => p.classList.remove('active'));
+  document.getElementById('panel-'+tab).classList.add('active');
+}
+
+// ─── Subject Selector ───────────────────────
+function selectSubject(btn, subj){
+  document.querySelectorAll('.subj-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  selectedSubject = subj;
+}
+
+// ─── Ask Bot ────────────────────────────────
+function askBot(){
+  const q = document.getElementById('quickQuestion').value.trim();
+  if(!q) return;
+  socket.emit('ask_bot', {question:q, subject:selectedSubject});
+  document.getElementById('quickQuestion').value = '';
+}
+document.getElementById('quickQuestion').addEventListener('keydown', e => {
+  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); askBot(); }
+});
+
+// ─── Chat ────────────────────────────────────
+const msgInput = document.getElementById('msgInput');
+msgInput.addEventListener('input',()=>{
+  msgInput.style.height='auto';
+  msgInput.style.height = Math.min(msgInput.scrollHeight,110)+'px';
+});
+
+function sendMessage(){
+  const msg = msgInput.value.trim();
+  if(!msg) return;
+  socket.emit('send_message', {message: msg});
+  msgInput.value='';
+  msgInput.style.height='auto';
+}
+
+function handleKey(e){
+  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendMessage(); }
+}
+
+// ─── PDF Upload ──────────────────────────────
+function pdfDragOver(e){ e.preventDefault(); document.getElementById('pdfDrop').classList.add('drag-over'); }
+function pdfDragLeave(){ document.getElementById('pdfDrop').classList.remove('drag-over'); }
+function pdfDrop_ev(e){
+  e.preventDefault();
+  pdfDragLeave();
+  const file = e.dataTransfer.files[0];
+  if(file && file.type==='application/pdf') handlePdfFile(file);
+}
+
+async function handlePdfFile(file){
+  if(!file) return;
+  const status = document.getElementById('pdfStatus');
+  status.className='pdf-status loading';
+  status.textContent='📄 Reading PDF...';
+
+  try{
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({data: arrayBuffer}).promise;
+    let fullText = '';
+
+    for(let i=1; i<=Math.min(pdf.numPages, 30); i++){
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const pageText = content.items.map(item => item.str).join(' ');
+      fullText += pageText + '\n\n';
+    }
+
+    if(!fullText.trim()){
+      status.className='pdf-status err';
+      status.textContent='❌ Could not extract text (scanned PDF?)';
+      return;
+    }
+
+    status.textContent='🤖 StudyBot is analyzing...';
+
+    const response = await fetch('/upload-pdf', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({text: fullText, filename: file.name, username: myUsername})
+    });
+    const data = await response.json();
+
+    if(data.success){
+      status.className='pdf-status done';
+      status.textContent=`✅ "${file.name}" analyzed! Check the chat.`;
+    } else {
+      status.className='pdf-status err';
+      status.textContent='❌ Error: '+data.error;
+    }
+  } catch(err){
+    status.className='pdf-status err';
+    status.textContent='❌ Failed to read PDF: '+err.message;
+  }
+}
+
+// ─── Quiz Generator ──────────────────────────
+let quizData = null;
+let quizAnswers = {};
+let quizSubmitted = false;
+
+async function generateQuiz(){
+  const topic = document.getElementById('quizTopic').value.trim();
+  const subject = document.getElementById('quizSubject').value.trim() || 'General';
+  const count = document.getElementById('quizCount').value;
+
+  if(!topic){ document.getElementById('quizTopic').focus(); return; }
+
+  const btn = document.querySelector('.action-btn.gold');
+  btn.textContent='⏳ Generating...';
+  btn.disabled=true;
+
+  try{
+    const response = await fetch('/generate-quiz',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({topic, subject, count})
+    });
+    const data = await response.json();
+
+    if(data.success){
+      quizData = data.quiz;
+      quizAnswers = {};
+      quizSubmitted = false;
+      showQuiz(data.topic, data.subject);
+    } else {
+      alert('Error: '+data.error);
+    }
+  } catch(e){
+    alert('Network error: '+e.message);
+  } finally{
+    btn.textContent='🧠 Generate Quiz';
+    btn.disabled=false;
+  }
+}
+
+function showQuiz(topic, subject){
+  document.getElementById('quizTitle').textContent = `🧠 ${topic} — ${subject}`;
+  const body = document.getElementById('quizBody');
+  body.innerHTML='';
+
+  quizData.questions.forEach((q, qi) => {
+    const card = document.createElement('div');
+    card.className='quiz-question';
+    card.innerHTML=`
+      <div class="quiz-q-num">Question ${qi+1} of ${quizData.questions.length}</div>
+      <div class="quiz-q-text">${escapeHtml(q.q)}</div>
+      <div class="quiz-options" id="opts-${qi}">
+        ${q.options.map((opt,oi)=>`
+          <button class="quiz-opt" onclick="selectAnswer(${qi},'${String.fromCharCode(65+oi)}')" id="opt-${qi}-${String.fromCharCode(65+oi)}">
+            ${escapeHtml(opt)}
+          </button>
+        `).join('')}
+      </div>
+      <div class="quiz-explanation" id="exp-${qi}">💡 ${escapeHtml(q.explanation)}</div>
+    `;
+    body.appendChild(card);
+  });
+
+  // Submit button
+  const submitDiv = document.createElement('div');
+  submitDiv.style='text-align:center;margin-top:8px;';
+  submitDiv.innerHTML=`
+    <button class="action-btn" style="max-width:200px;" onclick="submitQuiz()">✅ Submit Quiz</button>
+  `;
+  body.appendChild(submitDiv);
+
+  document.getElementById('quizModal').classList.add('show');
+}
+
+function selectAnswer(qi, letter){
+  if(quizSubmitted) return;
+  quizAnswers[qi] = letter;
+  const opts = document.querySelectorAll(`#opts-${qi} .quiz-opt`);
+  opts.forEach(o => o.classList.remove('selected'));
+  document.getElementById(`opt-${qi}-${letter}`).classList.add('selected');
+}
+
+function submitQuiz(){
+  if(quizSubmitted) return;
+  quizSubmitted = true;
+
+  let score = 0;
+  quizData.questions.forEach((q, qi)=>{
+    const chosen = quizAnswers[qi];
+    const correct = q.answer;
+    if(chosen === correct) score++;
+
+    // Mark options
+    const opts = document.querySelectorAll(`#opts-${qi} .quiz-opt`);
+    opts.forEach(o => {
+      const letter = o.id.split('-')[2];
+      if(letter===correct) o.classList.add('correct');
+      else if(chosen && letter===chosen && chosen!==correct) o.classList.add('wrong');
+    });
+
+    // Show explanation
+    document.getElementById(`exp-${qi}`).classList.add('show');
+  });
+
+  // Show score
+  const total = quizData.questions.length;
+  const pct = Math.round(score/total*100);
+  const emoji = pct>=80?'🎉':pct>=60?'👍':pct>=40?'📚':'💪';
+
+  const scoreDiv = document.createElement('div');
+  scoreDiv.className='quiz-score';
+  scoreDiv.innerHTML=`
+    <div class="quiz-score-num">${score}/${total}</div>
+    <div class="quiz-score-label">${pct}% — ${emoji} ${pct>=80?'Excellent!':pct>=60?'Good job!':pct>=40?'Keep studying!':'Keep practicing!'}</div>
+    <button class="action-btn" style="max-width:180px;margin-top:16px;" onclick="closeQuiz()">Close</button>
+  `;
+  document.getElementById('quizBody').appendChild(scoreDiv);
+
+  // Post score to chat
+  socket.emit('send_message', {
+    message: `🧠 Quiz Result: "${document.getElementById('quizTitle').textContent.replace('🧠 ','')}" — Scored ${score}/${total} (${pct}%) ${emoji}`
+  });
+}
+
+function closeQuiz(){
+  document.getElementById('quizModal').classList.remove('show');
+}
+
+// ─── Pomodoro Timer ─────────────────────────
+const TIMER_MODES = {focus:{mins:25,label:'FOCUS'},short:{mins:5,label:'SHORT BREAK'},long:{mins:15,label:'LONG BREAK'}};
+let currentMode = 'focus';
+let timerSeconds = 25*60;
+let timerMax = 25*60;
+let timerRunning = false;
+let timerInterval = null;
+let sessionCount = 0;
+
+function setTimerMode(mode){
+  if(timerRunning) return;
+  currentMode = mode;
+  document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('mode-'+mode).classList.add('active');
+  timerSeconds = TIMER_MODES[mode].mins * 60;
+  timerMax = timerSeconds;
+  document.getElementById('timerLabel').textContent = TIMER_MODES[mode].label;
+  updateTimerDisplay();
+}
+
+function toggleTimer(){
+  timerRunning = !timerRunning;
+  const btn = document.getElementById('timerStartBtn');
+  if(timerRunning){
+    btn.textContent='⏸ Pause';
+    timerInterval = setInterval(timerTick, 1000);
+  } else {
+    btn.textContent='▶ Resume';
+    clearInterval(timerInterval);
+  }
+}
+
+function timerTick(){
+  if(timerSeconds <= 0){
+    clearInterval(timerInterval);
+    timerRunning = false;
+    document.getElementById('timerStartBtn').textContent='▶ Start';
+    if(currentMode==='focus'){
+      sessionCount++;
+      document.getElementById('sessionCount').textContent = sessionCount;
+      socket.emit('send_message', {message: `⏱️ Completed a focus session! 🍅 Total: ${sessionCount} pomodoros`});
+      // auto suggest break
+      if(sessionCount%4===0){ setTimerMode('long'); }
+      else { setTimerMode('short'); }
+    } else {
+      setTimerMode('focus');
+    }
+    return;
+  }
+  timerSeconds--;
+  updateTimerDisplay();
+}
+
+function updateTimerDisplay(){
+  const m = Math.floor(timerSeconds/60);
+  const s = timerSeconds%60;
+  const str = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  document.getElementById('timerDisplay').textContent = str;
+  document.getElementById('timerBadgeTime').textContent = str;
+
+  // Update ring
+  const circumference = 326.7;
+  const progress = timerSeconds / timerMax;
+  const offset = circumference * (1-progress);
+  document.getElementById('timerRing').style.strokeDashoffset = offset;
+
+  // Show badge in header when running
+  document.getElementById('timerBadge').style.display = timerRunning ? 'flex' : 'none';
+}
+
+function resetTimer(){
+  clearInterval(timerInterval);
+  timerRunning = false;
+  document.getElementById('timerStartBtn').textContent='▶ Start';
+  timerSeconds = TIMER_MODES[currentMode].mins * 60;
+  timerMax = timerSeconds;
+  updateTimerDisplay();
+}
+
+// ─── Voice Input ────────────────────────────
+let recognizing = false;
+let recognition = null;
+
+function toggleVoice(){
+  if(!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)){
+    alert('Voice input not supported in this browser. Try Chrome!');
+    return;
+  }
+  if(recognizing){
+    recognition.stop();
+    return;
+  }
+
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  recognition = new SpeechRecognition();
+  recognition.continuous = false;
+  recognition.interimResults = false;
+  recognition.lang = 'en-IN'; // Indian English + Tamil support
+
+  recognition.onstart = () => {
+    recognizing = true;
+    document.getElementById('voiceBtn').classList.add('recording');
+    document.getElementById('voiceBtn').textContent = '🔴';
+  };
+
+  recognition.onresult = (e) => {
+    const transcript = e.results[0][0].transcript;
+    msgInput.value = transcript;
+    msgInput.dispatchEvent(new Event('input'));
+  };
+
+  recognition.onend = () => {
+    recognizing = false;
+    document.getElementById('voiceBtn').classList.remove('recording');
+    document.getElementById('voiceBtn').textContent = '🎤';
+  };
+
+  recognition.onerror = (e) => {
+    recognizing = false;
+    document.getElementById('voiceBtn').classList.remove('recording');
+    document.getElementById('voiceBtn').textContent = '🎤';
+  };
+
+  recognition.start();
+}
+
+// ─── Messages ───────────────────────────────
+function getInitials(name){
+  return name.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
+}
+
+function addMessage(data){
+  const area = document.getElementById('messagesArea');
+  const isOwn = data.sid === socket.id;
+  const isBot = data.type === 'bot';
+
+  const div = document.createElement('div');
+  div.className = `message ${isOwn?'own':''} ${isBot?'bot-msg':''}`;
+
+  const avClass = isBot?'b':isOwn?'me':'u';
+  const avContent = isBot?'🤖':getInitials(data.username);
+  const nameClass = isBot?'bot':'';
+  const metaDir = isOwn?'style="justify-content:flex-end"':'';
+
+  div.innerHTML=`
+    <div class="msg-av ${avClass}">${avContent}</div>
+    <div class="msg-c">
+      <div class="msg-meta" ${metaDir}>
+        <span class="msg-name ${nameClass}">${data.username}</span>
+        <span class="msg-time">${data.timestamp}</span>
+      </div>
+      <div class="msg-bubble">${escapeHtml(data.message)}</div>
+    </div>`;
+
+  area.appendChild(div);
+  area.scrollTop = area.scrollHeight;
+}
+
+function addSysMsg(text){
+  const area = document.getElementById('messagesArea');
+  const d = document.createElement('div');
+  d.className='sys-msg';
+  d.textContent=text;
+  area.appendChild(d);
+  area.scrollTop=area.scrollHeight;
+}
+
+function escapeHtml(t){
+  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+}
+
+// ─── Socket ─────────────────────────────────
+socket.on('chat_history', d => d.messages.forEach(addMessage));
+socket.on('new_message', addMessage);
+socket.on('user_joined', d=>{
+  addSysMsg(`${d.username} joined 👋`);
+  document.getElementById('onlineCount').textContent=d.active_count;
+});
+socket.on('user_left', d=>{
+  addSysMsg(`${d.username} left`);
+  document.getElementById('onlineCount').textContent=d.active_count;
+});
+socket.on('active_users', d=>{
+  document.getElementById('onlineCount').textContent=d.users.length;
+  const list=document.getElementById('usersList');
+  list.innerHTML=d.users.map(u=>`
+    <div class="user-item">
+      <div class="u-avatar">${getInitials(u)}</div>
+      <span>${u}</span>
+    </div>`).join('');
+});
+socket.on('bot_typing', d=>{
+  document.getElementById('typingIndicator').classList.toggle('show',d.typing);
+  if(d.typing) document.getElementById('messagesArea').scrollTop=99999;
+});
+</script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+=========================
+
+
+
+from dotenv import load_dotenv
+load_dotenv()
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'student-chat-secret-2024'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=16 * 1024 * 1024)
+
+# ── Gemini Setup (gemini-1.5-flash = FREE tier: 15 RPM, 1500 RPD) ─────────
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
