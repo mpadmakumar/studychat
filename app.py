@@ -8,10 +8,8 @@ from datetime import datetime
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'student-chat-secret-2024'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
-# Use gevent on Render (production), threading locally (Python 3.14 compat)
-import os as _os
-_async_mode = "gevent" if _os.environ.get("RENDER") else "threading"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode=_async_mode,
+# threading mode — works on Python 3.14 + all versions
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
                     max_http_buffer_size=16 * 1024 * 1024)
 
 # ── Groq Setup — Pure HTTP (Python 3.14 compatible) ───
@@ -329,9 +327,6 @@ def on_ask_bot(data):
     except Exception as e:
         emit("bot_typing", {"typing": False}, broadcast=True)
         emit("error", {"message": str(e)})
-
-# ── Gunicorn entry point (Render production) ─────────
-socketio_app = socketio.middleware(app)
 
 if __name__ == "__main__":
     if not GROQ_API_KEY:
